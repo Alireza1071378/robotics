@@ -4,6 +4,10 @@ import rectangle_overlap as ro
 import cv2
 import matplotlib.pyplot as plt
 import time
+from dash import Dash, html, dash_table, dcc, callback, Output, Input, State, callback_context
+import plotly.graph_objs as go
+import plotly.express as px
+from dash.exceptions import PreventUpdate
 
 
 def get_y_rotation(angle):
@@ -38,9 +42,18 @@ class gadget:
 
 
 class motor(gadget):
-    def __init__(self, id):
+    def __init__(self, id, range):
         super().__init__(id)
         self.motor_angle = 0
+        self.range = tuple(np.deg2rad(range))
+    
+    def rotate_by(self, angle):
+        final_angle = self.motor_angle + angle
+        if (final_angle < self.range[0]) or (final_angle > self.range[1]):
+            raise Exception('rotation out of range!')
+        else:
+            self.motor_angle = final_angle
+
 
 
 class camera(gadget):
@@ -55,7 +68,7 @@ class camera(gadget):
             self.source = source
 
     def get_direction_from_point_on_screen(self, location_on_screen):
-        direction = np.insert(np.flip((np.array(self.resolution) - 2 * np.array(location_on_screen)) * np.tan(np.deg2rad(self.angular_width) / 2) / self.resolution[0]), 0, 1)
+        direction = np.insert(np.flip((np.array(self.resolution) - 2 * np.array(location_on_screen)) * np.tan(np.deg2rad(self.angular_width) / 2) / self.resolution[1]), 0, 1)
         direction /= np.linalg.norm(direction)
         return direction.reshape((3, 1))  
     
@@ -156,7 +169,7 @@ class configuration_node:
 
     def rotate_motor_by(self, angle):
         if self.data.__class__.__name__ == 'motor':
-            self.data.motor_angle += angle
+            self.data.rotate_by(angle)
             self.node_basis_relative_to_parent = np.matmul(self.node_basis_relative_to_parent, get_z_rotation(angle))
             self.parent_basis_relative_to_node = np.matmul(get_z_rotation(-angle), self.parent_basis_relative_to_node)
             self.node_basis_relative_to_origin = np.matmul(self.node_basis_relative_to_origin, get_z_rotation(angle))
@@ -174,7 +187,7 @@ class configuration_node:
         for child in self.children:
             child.rotate_as_child_by(angle)
 
-    def get_nodes_data(self):
+    def get_subtree_data(self):
         data = {self.data.id: {'parent id': self.parent.data.id,
                                'children id': [child.data.id for child in self.children],
                                 'position_relative_to_parent': self.position_relative_to_parent, 
@@ -186,14 +199,38 @@ class configuration_node:
                                 'position': self.position, 
                                 'gadget_data': vars(self.data)}}
         for child in self.children:
-            data = {**data, **child.get_nodes_data()}
+            data = {**data, **child.get_subtree_data()}
         return data
+
+    def is_ancestor_of(self, query_node):
+        x = query_node
+        y = x
+        while True:
+            if x == self:
+                return True
+            else:
+                x = x.parent
+                if x == y:
+                    return False
+                else:
+                    y = y.parent
+
+    def get_max_distance_in_subtree(self):
+        if len(self.children) == 0:
+            return 0
+        else:
+            max_distance = 0
+            for child in self.children:
+                distance = child.get_max_distance_in_subtree() + np.linalg.norm(child.position_relative_to_parent)
+                if distance > max_distance:
+                    max_distance = distance
+            return max_distance
         
 
     
 class configuration:
     def __init__(self, *nodes):
-        self.root = configuration_node(motor('root'))
+        self.root = configuration_node(gadget('root'))
         self.nodes = {'root': self.root}
         self.simulator = configurationSimulator()
         for given_gadget, position_relative_to_parent, initial_Euler_angles_relative_to_parent in nodes:
@@ -262,7 +299,7 @@ class configuration:
                 raise Exception('no motor called ' + id + '!')
     
     def get_nodes_locations(self):
-        data = self.root.get_nodes_data()
+        data = self.root.get_subtree_data()
         data.pop('root')
         return {id: data[id]['position'] for id in data}
 
@@ -316,6 +353,10 @@ class configuration:
                 raise Exception('input id not found!')  
         else:
             raise Exception('output id not found!')
+
+    def get_radius(self):
+        return self.root.get_max_distance_in_subtree()
+
 
 
 class robot(configuration):
@@ -542,3 +583,253 @@ class robot(configuration):
             return coordinate_stats, (t_2 - t_1 + t_4 - t_3)    
         else:
             return coordinate_stats
+
+    def visualize(self, height = 500):
+        app = Dash()
+
+        radious = self.get_radius() + 1
+        field_x = radious
+        field_y = radious
+        field_z = radious
+
+        panels = {} #camera_id: camera_fig
+        gadget_controllers = []
+
+        cmap = plt.get_cmap("tab10")
+        colorscale = [[0, 'rgb' + str(cmap(1)[0:3])], 
+        [1, 'rgb' + str(cmap(2)[0:3])]]
+
+        sketch_components = {'floor': 0, 'nodes': 1, 'cameras': dict()}
+
+        sketch = go.Figure()
+        sketch.add_trace(go.Surface(x = np.linspace(-field_x, field_x, 10), y = np.linspace(-field_y, field_y, 10), z = 0 * np.ones((10, 10)), cmin=0, 
+        cmax=1, showscale=False, opacity = 0.3, surfacecolor= np.ones((10, 10)), colorscale=colorscale))
+
+
+        sketch.add_trace(go.Scatter3d(showlegend = False, 
+        x = [], y = [], z = [], 
+        marker=dict(size=4, colorscale='Viridis'), 
+        line=dict(color='darkblue', width=6)))
+
+        actual_nodes = {**self.nodes}
+        actual_nodes.pop('root')
+
+        panel_outputs = []
+        click_inputs = []
+
+        panel_inputs = []
+        slider_inputs = []
+
+        component_counter = 2
+
+        for node_id in actual_nodes:
+            node = self.nodes.get(node_id)
+            gadget = node.data
+            if gadget.__class__.__name__ == 'camera':
+                camera_fig = px.imshow(
+                    np.zeros(shape=(*gadget.resolution, 4)))
+                camera_fig.add_scatter(
+                    x=[], 
+                    y=[], 
+                    mode='markers',
+                    marker_color='red',
+                    marker_size=10)
+                camera_fig.update_layout(margin=dict(l=30, r=30, t=0, b=0))
+
+                controller = [dcc.Graph(id = node_id, style = {'height': '%dpx'%int(0.3 * height), 'width': '100%', 'padding': '0px', 'margine': '0px'}, figure = camera_fig)]
+                panels[node_id] = camera_fig
+        
+                sketch_components['cameras'][node_id] = {'direction0': component_counter, 
+                'direction1': component_counter + 1, 
+                'direction2': component_counter + 2, 
+                'direction_tips': component_counter + 3,
+                'panel': component_counter + 4,
+                'line_of_sight': component_counter + 5
+                }
+                component_counter += 6
+        
+                sketch.add_traces([go.Scatter3d(showlegend = False, 
+                x = [], y = [], z = [], 
+                marker=dict(size=4, colorscale='Viridis'), 
+                mode = 'lines+markers+text', text = ['', "x'"], 
+                line=dict(color='yellow', width=3)), 
+                go.Scatter3d(showlegend = False, 
+                x = [], y = [], z = [], 
+                marker=dict(size=4, colorscale='Viridis'), 
+                mode = 'lines+markers+text', text = ['', "y'"], 
+                line=dict(color='yellow', width=3)), 
+                go.Scatter3d(showlegend = False, 
+                x = [], y = [], z = [], 
+                marker=dict(size=4, colorscale='Viridis'), 
+                mode = 'lines+markers+text', text = ['', "z'"], 
+                line=dict(color='yellow', width=3)), 
+                go.Cone(showlegend=False, 
+                x=[], y=[], z=[], u=[], v=[], w=[], 
+                colorscale = [[0, 'rgb(255,255,0)'], [1, 'rgb(255,255,0)']], showscale=False, cmin = 0, cmax = 1, sizemode="raw"), 
+                go.Mesh3d(x=[], y=[], z=[], color='lightgray', opacity=0.5), 
+                go.Scatter3d(showlegend = False, 
+                x = [], y = [], z = [], 
+                marker=dict(size=4, colorscale='Viridis'), 
+                line=dict(color='red', width=2))
+                ])
+
+                panel_outputs.append(Output(node_id, 'figure'))
+                click_inputs.append(Input(node_id, 'clickData'))
+        
+                panel_inputs.append(Input(node_id, 'figure'))
+    
+    
+            elif gadget.__class__.__name__ == 'motor':
+                controller = [
+                dcc.Slider(id = node_id, min = np.rad2deg(gadget.range[0]), max = np.rad2deg(gadget.range[1]), value = self.nodes.get(node_id).data.motor_angle)]
+        
+                slider_inputs.append(Input(node_id, 'value'))
+         
+            gadget_controllers.append(html.Div(style = {'width': '100%', 'padding': '10px'}, children = [html.Label(node_id, style = {'margine': '10px', 'padding': '10px'})] + controller))
+
+            sketch_components[node_id] = go.Scatter3d(showlegend = False, 
+            marker=dict(size=4, colorscale='Viridis'), 
+            line=dict(color='darkblue', width=6))
+    
+        
+        
+
+
+        app.layout = html.Div(style = {'width': '100%', 'height': '%dpx'%(height), 'display': 'flex'}, children = [
+            html.Div(style = {'flex': '0 0 70%'}, children = [
+                dcc.Graph(id = 'sketch', style = {'width': '100%', 'height': '%dpx'%(height), 'padding': '0px', 'margine': '0px'}, figure = sketch)
+                ]), 
+                html.Div(style = {'height': '%dpx'%int(height * 0.5), 'overflowY': 'scroll', 'flex': '0 0 30%', 'border': '1px solid black'}, children = gadget_controllers)
+                ])
+
+
+
+        @app.callback(
+            panel_outputs, click_inputs, prevent_initial_call=True
+            )
+        def update_panels(*args):
+            camera_id = callback_context.triggered[0].get('prop_id')[:-len('.clickData')]
+            graph_figure = panels[camera_id]
+            clickData = callback_context.triggered[0].get('value')
+            if not clickData:
+                raise PreventUpdate
+            else:
+                points = clickData.get('points')[0]
+                x = points.get('x')
+                y = points.get('y')
+                graph_figure['data'][1].update(x = [x])
+                graph_figure['data'][1].update(y = [y])
+
+            return tuple(panels.values())
+
+
+        @app.callback(
+            Output('sketch', 'figure'), panel_inputs + slider_inputs
+            )
+        def update_sketch(*args):
+            t = 0.1
+            d = 0.9
+            prop = callback_context.triggered[0].get('prop_id')
+            if prop.endswith('figure'):
+                node_id = prop[:-len('.figure')]
+        
+                camera_figure = callback_context.triggered[0].get('value')
+
+                camera_node = self.nodes.get(node_id)
+                directions = camera_node.node_basis_relative_to_origin
+                point_on_screen = np.array(camera_figure['data'][1]['y'] + camera_figure['data'][1]['x'])
+                camera_to_point = camera_node.data.get_direction_from_point_on_screen(point_on_screen)
+                end_of_arrow = np.sqrt(field_x ** 2 + field_y ** 2 + field_z ** 2) * camera_to_point
+                camera_to_point *= (d / camera_to_point[0, 0])
+                point_in_front_of_camera = camera_node.position + np.matmul(directions, camera_to_point)
+                end_of_arrow = camera_node.position + np.matmul(directions, end_of_arrow)
+                the_line = np.hstack((camera_node.position, point_in_front_of_camera, end_of_arrow))
+
+                sketch.data[sketch_components['cameras'][node_id]['line_of_sight']].x = the_line[0, :]
+                sketch.data[sketch_components['cameras'][node_id]['line_of_sight']].y = the_line[1, :]
+                sketch.data[sketch_components['cameras'][node_id]['line_of_sight']].z = the_line[2, :]
+        
+            else:
+                if prop.endswith('value'):
+                    node_id = prop[:-len('.value')]
+                    angle = callback_context.triggered[0].get('value')
+                    self.set_motors_angle(**{node_id: angle})
+                elif prop == '.':
+                    node_id = 'root'
+            
+                joints = np.array(list(self.get_nodes_locations().values()))
+        
+                sketch.data[sketch_components['nodes']].x = joints[:, 0, 0]
+                sketch.data[sketch_components['nodes']].y = joints[:, 1, 0]
+                sketch.data[sketch_components['nodes']].z = joints[:, 2, 0]
+
+                for camera_id in list(panels.keys()):
+                    camera_node = self.nodes.get(camera_id)
+                    node = self.nodes.get(node_id)
+
+                    if node.is_ancestor_of(camera_node):
+                        camera_focal_point = camera_node.position[:, 0]
+                        directions = camera_node.node_basis_relative_to_origin
+                        x_prime, y_prime, z_prime = (directions).T
+                
+                        sketch.data[sketch_components['cameras'][camera_id]['direction0']].x = [camera_focal_point[0], camera_focal_point[0] + x_prime[0]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction0']].y = [camera_focal_point[1], camera_focal_point[1] + x_prime[1]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction0']].z = [camera_focal_point[2], camera_focal_point[2] + x_prime[2]]
+                
+                        sketch.data[sketch_components['cameras'][camera_id]['direction1']].x = [camera_focal_point[0], camera_focal_point[0] + y_prime[0]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction1']].y = [camera_focal_point[1], camera_focal_point[1] + y_prime[1]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction1']].z = [camera_focal_point[2], camera_focal_point[2] + y_prime[2]]
+
+                        sketch.data[sketch_components['cameras'][camera_id]['direction2']].x = [camera_focal_point[0], camera_focal_point[0] + z_prime[0]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction2']].y = [camera_focal_point[1], camera_focal_point[1] + z_prime[1]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction2']].z = [camera_focal_point[2], camera_focal_point[2] + z_prime[2]]
+                
+                        sketch.data[sketch_components['cameras'][camera_id]['direction_tips']].x = [camera_focal_point[0] + x_prime[0], camera_focal_point[0] + y_prime[0], camera_focal_point[0] + z_prime[0]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction_tips']].y = [camera_focal_point[1] + x_prime[1], camera_focal_point[1] + y_prime[1], camera_focal_point[1] + z_prime[1]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction_tips']].z = [camera_focal_point[2] + x_prime[2], camera_focal_point[2] + y_prime[2], camera_focal_point[2] + z_prime[2]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction_tips']].u = [t * x_prime[0], t * y_prime[0], t * z_prime[0]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction_tips']].v = [t * x_prime[1], t * y_prime[1], t * z_prime[1]]
+                        sketch.data[sketch_components['cameras'][camera_id]['direction_tips']].w = [t * x_prime[2], t * y_prime[2], t * z_prime[2]]
+
+                        y_half_range_of_screen = np.tan(np.deg2rad(camera_node.data.angular_width / 2))
+                        z_half_range_of_screen = y_half_range_of_screen * camera_node.data.resolution[0] / camera_node.data.resolution[1]
+                        screen_points = d * np.array([
+                            [1, y_half_range_of_screen, z_half_range_of_screen], 
+                            [1, -y_half_range_of_screen, z_half_range_of_screen],
+                            [1, -y_half_range_of_screen, -z_half_range_of_screen],
+                            [1, y_half_range_of_screen, -z_half_range_of_screen]
+                            ]).T
+                        screen_points = camera_node.position + np.matmul(directions, screen_points)
+                
+                        sketch.data[sketch_components['cameras'][camera_id]['panel']].x = screen_points[0, :]
+                        sketch.data[sketch_components['cameras'][camera_id]['panel']].y = screen_points[1, :]
+                        sketch.data[sketch_components['cameras'][camera_id]['panel']].z = screen_points[2, :]
+
+                        camera_figure = panels[camera_id]
+                        point_on_screen = np.array(camera_figure['data'][1]['y'] + camera_figure['data'][1]['x'])
+                        if len(point_on_screen) != 0:
+                            camera_to_point = camera_node.data.get_direction_from_point_on_screen(point_on_screen)
+                            end_of_arrow = np.sqrt(field_x ** 2 + field_y ** 2 + field_z ** 2) * camera_to_point
+                            camera_to_point *= (d / camera_to_point[0, 0])
+                            point_in_front_of_camera = camera_node.position + np.matmul(directions, camera_to_point)
+                            end_of_arrow = camera_node.position + np.matmul(directions, end_of_arrow)
+                            the_line = np.hstack((camera_node.position, point_in_front_of_camera, end_of_arrow))
+
+                            sketch.data[sketch_components['cameras'][camera_id]['line_of_sight']].x = the_line[0, :]
+                            sketch.data[sketch_components['cameras'][camera_id]['line_of_sight']].y = the_line[1, :]
+                            sketch.data[sketch_components['cameras'][camera_id]['line_of_sight']].z = the_line[2, :]
+                    
+            return sketch
+    
+
+        sketch.update_layout(scene=dict(aspectmode='manual', 
+        xaxis_title='X Axis', 
+        yaxis_title='Y Axis', 
+        zaxis_title='Z Axis', aspectratio=dict(x=2, y=2, z=1), 
+        xaxis=dict(range=[-field_x, field_x]), 
+        yaxis=dict(range=[-field_y, field_y]), 
+        zaxis=dict(range=[0, field_z])), 
+        title='The Sketch of the Robot', 
+        margin=dict(l=30, r=30, t=0, b=0))
+
+        return app
